@@ -1,0 +1,23 @@
+name: validate-skills
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  personal-secretary-reminders:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run Python tests
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python3 -m unittest discover -s tests/personal-secretary-reminders -p 'test_secretary.py' -v
+      - name: Validate deployment scripts
+        run: bash -n tools/openclaw-deploy/*.sh
