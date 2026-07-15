@@ -8,7 +8,7 @@ DRY_RUN=0
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 usage() {
-  echo "Usage: $0 --repo <private-git-url> --ref <version-tag> --skill-path <folder> [--dry-run]"
+  echo "Usage: $0 --repo <git-url> --ref <version-tag> --skill-path <folder> [--dry-run]"
 }
 
 while [[ $# -gt 0 ]]; do

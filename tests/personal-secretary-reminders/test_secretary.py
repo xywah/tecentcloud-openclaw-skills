@@ -408,7 +408,7 @@ class SecretaryTests(unittest.TestCase):
         scripts = [
             tools_dir / "preflight_openclaw.sh",
             tools_dir / "deploy_openclaw.sh",
-            tools_dir / "update_from_private_github.sh",
+            tools_dir / "update_from_github.sh",
         ]
         subprocess.run(["bash", "-n", *(str(path) for path in scripts)], check=True)
         completed = subprocess.run(
@@ -434,7 +434,7 @@ class SecretaryTests(unittest.TestCase):
         )
         subprocess.run(["git", "tag", "personal-secretary-reminders-test"], cwd=source_repo, check=True)
         completed = subprocess.run(
-            [str(tools_dir / "update_from_private_github.sh"),
+            [str(tools_dir / "update_from_github.sh"),
              "--repo", str(source_repo),
              "--ref", "personal-secretary-reminders-test",
              "--skill-path", "personal-secretary-reminders",

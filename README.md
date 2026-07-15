@@ -1,6 +1,6 @@
 # Tencent Cloud OpenClaw Skills
 
-Private monorepo for skills developed locally with Codex and deployed to the Tencent Cloud OpenClaw `main` agent.
+Public source monorepo for Skills developed locally with Codex, published through SkillHub/ClawHub, and run by the Tencent Cloud OpenClaw `main` agent.
 
 ## Layout
 
@@ -13,11 +13,24 @@ tecentcloud-openclaw-skills/
 
 Every Skill lives in its own top-level folder. The folder name must match the `name` in its `SKILL.md`. Future Skills should be added as peer folders, not nested inside an existing Skill.
 
-## Deploy one Skill
+## Recommended install and update
+
+The preferred distribution path is the official OpenClaw SkillHub/ClawHub listing. On the Tencent Cloud server, use the exact owner/slug shown on that listing:
 
 ```bash
-tools/openclaw-deploy/update_from_private_github.sh \
-  --repo git@github.com:xywah/tecentcloud-openclaw-skills.git \
+openclaw skills install <owner/slug> --agent main
+openclaw skills update <owner/slug> --agent main
+```
+
+This repository remains the public source of truth. Codex changes and tests the source here; SkillHub/ClawHub publishes installable versions; the Tencent Cloud server keeps runtime data and WeChat configuration.
+
+## Tagged GitHub fallback
+
+For recovery, explicit tag deployment, or diagnostics, one Skill can still be installed directly from this public repository:
+
+```bash
+tools/openclaw-deploy/update_from_github.sh \
+  --repo https://github.com/xywah/tecentcloud-openclaw-skills.git \
   --ref personal-secretary-reminders-v1.2.0 \
   --skill-path personal-secretary-reminders
 ```
@@ -26,4 +39,4 @@ The deployment tool installs only the selected Skill folder. Tests, repository d
 
 ## Data boundary
 
-Never commit databases, exports, backups, credentials, chat identifiers, or server configuration. Stateful Skill data stays under `~/.openclaw/data/<skill-name>/` on the cloud server.
+This repository is public. Never commit databases, exports, backups, credentials, chat identifiers, personal reminder content, or server configuration. Stateful Skill data stays under `~/.openclaw/data/<skill-name>/` on the cloud server.
