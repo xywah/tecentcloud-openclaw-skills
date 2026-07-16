@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -51,10 +52,31 @@ class SecretaryTests(unittest.TestCase):
     def finalize(self, fields):
         return self.db.finalize({"confirmed": True, "fields": fields})
 
+    def cron_binding(self, reminder_id, job_id, **proof_overrides):
+        proof = {
+            "job_kind": "command",
+            "job_name": f"psr:{reminder_id}",
+            "command_runner": str(CRON_RUNNER),
+            "command_reminder_id": reminder_id,
+            "delivery_mode": "announce",
+            "delivery_channel": "openclaw-weixin",
+            "delivery_target_present": True,
+            "delivery_matches_current_context": True,
+            "isolated_session": False,
+            "verified_via": "cron_show",
+        }
+        proof.update(proof_overrides)
+        return {
+            "reminder_id": reminder_id,
+            "cron_job_id": job_id,
+            "delivery_proof": proof,
+        }
+
     def test_init_and_doctor(self):
         result = self.db.doctor()
         self.assertTrue(result["ok"])
         self.assertEqual(result["schema_version"], 1)
+        self.assertEqual(result["app_version"], "1.2.1")
         self.assertEqual(result["timezone"], "Asia/Shanghai")
         self.assertEqual(self.db.conn.execute("PRAGMA journal_mode").fetchone()[0], "wal")
 
@@ -272,13 +294,70 @@ class SecretaryTests(unittest.TestCase):
         self.assertEqual(result["recommendations"][0]["item"]["title"], "任务0")
         self.assertIn(result["recommendations"][0]["priority_label"], {"P1", "P2"})
 
+    def test_cron_binding_fails_closed_without_verified_delivery_target(self):
+        result = self.finalize(self.task_fields())
+        reminder_id = result["cron_plan"][0]["reminder_id"]
+        invalid_bindings = [
+            {"reminder_id": reminder_id, "cron_job_id": "legacy-job"},
+            self.cron_binding(reminder_id, "missing-target", delivery_target_present=False),
+            self.cron_binding(reminder_id, "last-channel", delivery_channel="last"),
+            self.cron_binding(reminder_id, "isolated-job", isolated_session=True),
+            self.cron_binding(reminder_id, "wrong-chat", delivery_matches_current_context=False),
+            self.cron_binding(reminder_id, "leaked-target", target="private-user-id"),
+        ]
+        for binding in invalid_bindings:
+            with self.subTest(job=binding["cron_job_id"]):
+                with self.assertRaises(secretary.SecretaryError):
+                    self.db.bind_cron({"reminder_bindings": [binding]})
+        row = self.db.conn.execute(
+            "SELECT status,cron_job_id FROM reminders WHERE id=?", (reminder_id,)
+        ).fetchone()
+        self.assertEqual(row["status"], "pending_cron")
+        self.assertIsNone(row["cron_job_id"])
+
+    def test_verified_cron_binding_is_sanitized_and_auditable(self):
+        result = self.finalize(self.task_fields())
+        reminder_id = result["cron_plan"][0]["reminder_id"]
+        bound = self.db.bind_cron({
+            "reminder_bindings": [self.cron_binding(reminder_id, "verified-job")]
+        })
+        self.assertEqual(bound["bound"], 1)
+        audit_text = self.db.conn.execute(
+            "SELECT after_json FROM audit_log WHERE action='bind_cron' ORDER BY created_at DESC LIMIT 1"
+        ).fetchone()[0]
+        self.assertIn('"delivery_target_present":true', audit_text)
+        self.assertNotIn("private-user-id", audit_text)
+        self.assertNotIn('"target"', audit_text)
+        plan = self.db.cron_audit_plan()
+        self.assertEqual(plan["app_version"], "1.2.1")
+        self.assertEqual(plan["jobs"][0]["expected_job_kind"], "command")
+        self.assertEqual(plan["jobs"][0]["expected_job_name"], f"psr:{reminder_id}")
+        self.assertFalse(plan["jobs"][0]["requires_recreation"])
+
+    def test_wechat_outputs_are_plain_text_without_decorative_emoji(self):
+        self.finalize(self.task_fields())
+        emoji_pattern = re.compile(
+            "[\U0001F000-\U0001FAFF\U00002600-\U000027BF\U0000FE0F]"
+        )
+        outputs = [
+            self.db.plan_now({"available_minutes": 180, "energy": "high", "context": "电脑"}),
+            self.db.agenda("week", {}),
+            self.db.digest("daily", {}),
+            self.db.digest("weekly", {}),
+            self.db.digest("monthly", {}),
+        ]
+        for output in outputs:
+            with self.subTest(kind=output.get("kind") or output.get("period") or "plan-now"):
+                self.assertFalse(output["output_contract"]["emoji"])
+                self.assertIsNone(emoji_pattern.search(output["wechat_text"]))
+
     def test_p1_follow_up_once_and_ack_cancels_it(self):
         result = self.finalize(self.task_fields(deadline_at="2026-07-15T20:00:00+08:00"))
         followups = [r for r in result["cron_plan"] if r["kind"] == "p1_follow_up"]
         self.assertEqual(len(followups), 1)
-        self.db.bind_cron({"reminder_bindings": [{
-            "reminder_id": followups[0]["reminder_id"], "cron_job_id": "job-follow"
-        }]})
+        self.db.bind_cron({"reminder_bindings": [
+            self.cron_binding(followups[0]["reminder_id"], "job-follow")
+        ]})
         ack = self.db.ack({"item_id": result["item"]["id"]})
         self.assertEqual(ack["cancelled_follow_up_count"], 1)
         self.assertEqual(ack["cron_job_ids_to_remove"], ["job-follow"])
@@ -287,9 +366,9 @@ class SecretaryTests(unittest.TestCase):
     def test_fire_reminder_is_idempotent_and_suppresses_terminal_items(self):
         result = self.finalize(self.task_fields())
         reminder = result["cron_plan"][0]
-        self.db.bind_cron({"reminder_bindings": [{
-            "reminder_id": reminder["reminder_id"], "cron_job_id": "job-fire"
-        }]})
+        self.db.bind_cron({"reminder_bindings": [
+            self.cron_binding(reminder["reminder_id"], "job-fire")
+        ]})
         fired = self.db.fire_reminder({"reminder_id": reminder["reminder_id"]})
         self.assertTrue(fired["deliver"])
         self.assertEqual(fired["wechat_text"], reminder["message"])
@@ -299,9 +378,9 @@ class SecretaryTests(unittest.TestCase):
 
         terminal = self.finalize(self.task_fields(title="已经完成的事项"))
         terminal_reminder = terminal["cron_plan"][0]
-        self.db.bind_cron({"reminder_bindings": [{
-            "reminder_id": terminal_reminder["reminder_id"], "cron_job_id": "job-terminal"
-        }]})
+        self.db.bind_cron({"reminder_bindings": [
+            self.cron_binding(terminal_reminder["reminder_id"], "job-terminal")
+        ]})
         self.db.complete({"item_id": terminal["item"]["id"]})
         suppressed = self.db.fire_reminder({"reminder_id": terminal_reminder["reminder_id"]})
         self.assertFalse(suppressed["deliver"])
@@ -309,9 +388,9 @@ class SecretaryTests(unittest.TestCase):
     def test_cron_runner_outputs_exact_text_then_no_reply(self):
         result = self.finalize(self.task_fields())
         reminder = result["cron_plan"][0]
-        self.db.bind_cron({"reminder_bindings": [{
-            "reminder_id": reminder["reminder_id"], "cron_job_id": "job-runner"
-        }]})
+        self.db.bind_cron({"reminder_bindings": [
+            self.cron_binding(reminder["reminder_id"], "job-runner")
+        ]})
         first = subprocess.run(
             ["python3", str(CRON_RUNNER), "reminder", "--reminder-id", reminder["reminder_id"],
              "--db", str(self.db_path), "--now", "2026-07-15T10:00:00+08:00"],
@@ -328,9 +407,9 @@ class SecretaryTests(unittest.TestCase):
     def test_pause_resume_reminder_state_and_terminal_sync_error(self):
         result = self.finalize(self.task_fields())
         reminder = result["cron_plan"][0]
-        self.db.bind_cron({"reminder_bindings": [{
-            "reminder_id": reminder["reminder_id"], "cron_job_id": "job-state"
-        }]})
+        self.db.bind_cron({"reminder_bindings": [
+            self.cron_binding(reminder["reminder_id"], "job-state")
+        ]})
         paused = self.db.update_item({
             "action": "set-reminder-state", "reminder_ids": [reminder["reminder_id"]], "state": "paused"
         })
@@ -354,14 +433,14 @@ class SecretaryTests(unittest.TestCase):
     def test_reschedule_returns_create_before_delete_protocol(self):
         result = self.finalize(self.task_fields())
         first = result["cron_plan"][0]
-        self.db.bind_cron({"reminder_bindings": [{"reminder_id": first["reminder_id"], "cron_job_id": "old-job"}]})
+        self.db.bind_cron({"reminder_bindings": [self.cron_binding(first["reminder_id"], "old-job")]})
         changed = self.db.reschedule({"item_id": result["item"]["id"], "deadline_at": "2026-07-18T17:30:00+08:00"})
         self.assertIn("old-job", changed["remove_after_success"])
         self.assertTrue(changed["cron_plan"])
         self.assertIn("create new cron jobs", changed["protocol"])
         new_first = changed["cron_plan"][0]
         bound = self.db.bind_cron({
-            "reminder_bindings": [{"reminder_id": new_first["reminder_id"], "cron_job_id": "new-job"}],
+            "reminder_bindings": [self.cron_binding(new_first["reminder_id"], "new-job")],
             "retire_reminder_ids": changed["old_reminder_ids"],
         })
         self.assertIn("old-job", bound["cron_job_ids_to_remove"])
@@ -398,7 +477,7 @@ class SecretaryTests(unittest.TestCase):
         package_text = "\n".join(
             path.read_text(encoding="utf-8")
             for path in package_root.rglob("*")
-            if path.is_file()
+            if path.is_file() and path.suffix.lower() not in {".pyc", ".pyo"}
         )
         for banned in ("qclaw", "/Users/", "/root/", "PERSONAL_SECRETARY_RUNTIME"):
             self.assertNotIn(banned, package_text.lower() if banned == "qclaw" else package_text)
@@ -408,7 +487,7 @@ class SecretaryTests(unittest.TestCase):
         scripts = [
             tools_dir / "preflight_openclaw.sh",
             tools_dir / "deploy_openclaw.sh",
-            tools_dir / "update_from_private_github.sh",
+            tools_dir / "update_from_github.sh",
         ]
         subprocess.run(["bash", "-n", *(str(path) for path in scripts)], check=True)
         completed = subprocess.run(
@@ -434,7 +513,7 @@ class SecretaryTests(unittest.TestCase):
         )
         subprocess.run(["git", "tag", "personal-secretary-reminders-test"], cwd=source_repo, check=True)
         completed = subprocess.run(
-            [str(tools_dir / "update_from_private_github.sh"),
+            [str(tools_dir / "update_from_github.sh"),
              "--repo", str(source_repo),
              "--ref", "personal-secretary-reminders-test",
              "--skill-path", "personal-secretary-reminders",

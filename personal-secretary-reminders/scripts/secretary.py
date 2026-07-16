@@ -25,6 +25,7 @@ from zoneinfo import ZoneInfo
 
 
 APP_NAME = "personal-secretary-reminders"
+APP_VERSION = "1.2.1"
 SCHEMA_VERSION = 1
 ACTIVE_STATES = ("active", "scheduled", "pending_schedule", "sync_error")
 VALID_STATES = {
@@ -261,7 +262,8 @@ class SecretaryDB:
                     "INSERT OR IGNORE INTO settings(key,value_json,updated_at) VALUES(?,?,?)",
                     (key, json_dumps(value), now),
                 )
-        return {"database": str(self.path), "schema_version": SCHEMA_VERSION, "journal_mode": "wal"}
+        return {"app_version": APP_VERSION, "database": str(self.path),
+                "schema_version": SCHEMA_VERSION, "journal_mode": "wal"}
 
     def setting(self, key: str, default: Any = None) -> Any:
         row = self.conn.execute("SELECT value_json FROM settings WHERE key=?", (key,)).fetchone()
@@ -304,6 +306,7 @@ class SecretaryDB:
             counts[table] = self.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
         return {
             "ok": integrity == "ok" and not foreign_keys,
+            "app_version": APP_VERSION,
             "database": str(self.path),
             "integrity": integrity,
             "foreign_key_errors": len(foreign_keys),
@@ -760,15 +763,70 @@ class SecretaryDB:
             return {"draft": self.get_draft(entity_id)}
         raise SecretaryError(f"unsupported entity: {entity}")
 
+    @staticmethod
+    def _validate_cron_binding(binding: dict[str, Any]) -> dict[str, Any]:
+        """Fail closed unless a normalized, non-sensitive delivery proof is complete."""
+        reminder_id = str(binding.get("reminder_id") or "").strip()
+        cron_job_id = str(binding.get("cron_job_id") or "").strip()
+        if not reminder_id or not cron_job_id:
+            raise SecretaryError("cron binding requires non-empty reminder_id and cron_job_id")
+        proof = binding.get("delivery_proof")
+        if not isinstance(proof, dict):
+            raise SecretaryError("cron binding requires delivery_proof from openclaw cron show")
+        forbidden = {"delivery_to", "recipient", "recipient_id", "target", "target_id", "openid", "open_id"}
+        leaked = sorted(key for key in proof if key.lower() in forbidden)
+        if leaked:
+            raise SecretaryError("delivery_proof must not contain raw recipient identifiers")
+
+        expected_name = f"psr:{reminder_id}"
+        required_exact = {
+            "job_kind": "command",
+            "job_name": expected_name,
+            "command_reminder_id": reminder_id,
+            "delivery_mode": "announce",
+            "verified_via": "cron_show",
+        }
+        for key, expected in required_exact.items():
+            if proof.get(key) != expected:
+                raise SecretaryError(f"cron delivery proof mismatch: {key} must be {expected}")
+        if Path(str(proof.get("command_runner") or "")).name != "cron_runner.py":
+            raise SecretaryError("cron delivery proof must confirm cron_runner.py")
+        channel = str(proof.get("delivery_channel") or "").strip()
+        if not channel or channel.lower() == "last":
+            raise SecretaryError("cron delivery proof requires an explicit delivery channel")
+        if proof.get("delivery_target_present") is not True:
+            raise SecretaryError("cron delivery proof requires a non-empty delivery target")
+        if proof.get("delivery_matches_current_context") is not True:
+            raise SecretaryError("cron delivery target must match the current inbound chat")
+        if proof.get("isolated_session") is not False:
+            raise SecretaryError("reminder delivery must use a command job, not an isolated agent session")
+        return {
+            "reminder_id": reminder_id,
+            "cron_job_id": cron_job_id,
+            "delivery_proof": {
+                "job_kind": "command",
+                "job_name": expected_name,
+                "command_runner": "cron_runner.py",
+                "command_reminder_id": reminder_id,
+                "delivery_mode": "announce",
+                "delivery_channel": channel,
+                "delivery_target_present": True,
+                "delivery_matches_current_context": True,
+                "isolated_session": False,
+                "verified_via": "cron_show",
+            },
+        }
+
     def bind_cron(self, payload: dict[str, Any]) -> dict[str, Any]:
         bindings = payload.get("reminder_bindings") or []
         if not bindings:
             raise SecretaryError("update with action=bind-cron requires reminder_bindings")
+        verified_bindings = [self._validate_cron_binding(binding) for binding in bindings]
         item_ids = set()
         retired_ids = payload.get("retire_reminder_ids") or []
         old_jobs_to_remove: list[str] = []
         with self.conn:
-            for binding in bindings:
+            for binding in verified_bindings:
                 row = self.conn.execute("SELECT item_id,status FROM reminders WHERE id=?", (binding.get("reminder_id"),)).fetchone()
                 if not row:
                     raise SecretaryError(f"reminder not found: {binding.get('reminder_id')}")
@@ -795,10 +853,30 @@ class SecretaryDB:
                 if pending == 0:
                     self.conn.execute("UPDATE items SET status='active',updated_at=? WHERE id=? AND status='pending_schedule'",
                                       (iso_utc(self.now), item_id))
-                self.audit("item", item_id, "bind_cron", after=bindings)
-        return {"bound": len(bindings), "retired": len(retired_ids),
+                self.audit("item", item_id, "bind_cron", after=verified_bindings)
+        return {"bound": len(verified_bindings), "retired": len(retired_ids),
                 "cron_job_ids_to_remove": old_jobs_to_remove,
                 "items": [self.get_item(i) for i in sorted(item_ids)]}
+
+    def cron_audit_plan(self) -> dict[str, Any]:
+        rows = self.conn.execute(
+            "SELECT id,item_id,trigger_at,status,cron_job_id FROM reminders "
+            "WHERE batched=0 AND status IN ('active','pending_cron') AND trigger_at>? ORDER BY trigger_at",
+            (iso_utc(self.now),),
+        ).fetchall()
+        jobs = [{
+            "reminder_id": row["id"],
+            "item_id": row["item_id"],
+            "trigger_at": row["trigger_at"],
+            "status": row["status"],
+            "cron_job_id": row["cron_job_id"],
+            "expected_job_name": f"psr:{row['id']}",
+            "expected_job_kind": "command",
+            "expected_runner": "cron_runner.py",
+            "requires_recreation": not bool(row["cron_job_id"]),
+        } for row in rows]
+        return {"app_version": APP_VERSION, "count": len(jobs), "jobs": jobs,
+                "policy": "verify every job with cron show; recreate before retiring an invalid job"}
 
     def update_item(self, payload: dict[str, Any]) -> dict[str, Any]:
         if payload.get("action") == "bind-cron":
@@ -1272,6 +1350,7 @@ class SecretaryDB:
                 "conclusion_first": True,
                 "markdown_tables": False,
                 "raw_json": False,
+                "emoji": False,
             },
         }
         result["wechat_text"] = self._render_agenda(result, section_limit)
@@ -1316,7 +1395,7 @@ class SecretaryDB:
         return {"recommendations": recommendations, "considered": len(ranked),
                 "constraints": {"available_minutes": available, "energy": energy, "context": context},
                 "wechat_text": self._render_plan_now(recommendations),
-                "output_contract": {"format": "wechat_plain_text_v1", "markdown_tables": False}}
+                "output_contract": {"format": "wechat_plain_text_v1", "markdown_tables": False, "emoji": False}}
 
     def _render_daily_digest(self, result: dict[str, Any]) -> str:
         lines = [f"【今日简报｜{result['date']}】"]
@@ -1375,7 +1454,7 @@ class SecretaryDB:
             result = {"kind": kind, "date": str(local_now.date()), "focus": actionable[:3], "events": events,
                       "start_by_missed": start_by_missed, "overdue": overdue, "secondary": actionable[3:],
                       "waiting": [i for i in items if i["status"] in ("waiting", "delegated")],
-                      "output_contract": {"format": "wechat_plain_text_v1", "markdown_tables": False}}
+                      "output_contract": {"format": "wechat_plain_text_v1", "markdown_tables": False, "emoji": False}}
             result["wechat_text"] = self._render_daily_digest(result)
             return result
         if kind == "weekly":
@@ -1399,7 +1478,7 @@ class SecretaryDB:
                       "events": agenda["events"], "priorities": agenda["tasks"],
                       "last_week": stats, "zombie_projects": zombies,
                       "waiting": waiting, "ideas": ideas, "rule_recommendations": recs,
-                      "output_contract": {"format": "wechat_plain_text_v1", "markdown_tables": False}}
+                      "output_contract": {"format": "wechat_plain_text_v1", "markdown_tables": False, "emoji": False}}
             result["wechat_text"] = self._append_management_section(agenda["wechat_text"], "上周回顾与管理", notes)
             return result
         if kind == "monthly":
@@ -1421,7 +1500,7 @@ class SecretaryDB:
                       "priorities": agenda["tasks"], "projects": projects, "p2_watch": p2,
                       "someday_review": someday, "ideas": ideas, "metrics": stats,
                       "rule_recommendations": recs,
-                      "output_contract": {"format": "wechat_plain_text_v1", "markdown_tables": False}}
+                      "output_contract": {"format": "wechat_plain_text_v1", "markdown_tables": False, "emoji": False}}
             result["wechat_text"] = self._append_management_section(agenda["wechat_text"], "月度管理观察", notes)
             return result
         raise SecretaryError("digest kind must be daily, weekly, or monthly")
@@ -1565,6 +1644,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("command", choices=[
         "init", "doctor", "draft", "clarify", "finalize", "create-project", "set-next-action",
         "get", "update", "complete", "cancel", "ack", "snooze", "reschedule", "fire-reminder", "mark-sync-error",
+        "cron-audit-plan",
         "conflicts", "list", "agenda", "plan-now", "digest", "record-actual", "recommend-rules", "accept-rule",
         "backup", "export",
     ])
@@ -1586,6 +1666,7 @@ def dispatch(db: SecretaryDB, command: str, argument: str | None, payload: dict[
         "cancel": lambda: db.cancel(payload), "ack": lambda: db.ack(payload),
         "snooze": lambda: db.snooze(payload), "reschedule": lambda: db.reschedule(payload),
         "fire-reminder": lambda: db.fire_reminder(payload),
+        "cron-audit-plan": lambda: db.cron_audit_plan(),
         "mark-sync-error": lambda: db.mark_sync_error(payload), "conflicts": lambda: db.conflicts(payload),
         "list": lambda: db.list_items(payload),
         "agenda": lambda: db.agenda(argument or payload.get("period", "week"), payload),

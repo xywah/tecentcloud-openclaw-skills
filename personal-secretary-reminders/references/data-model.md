@@ -24,7 +24,7 @@ Skill 包内不保存数据库、缓存、备份、密钥、渠道 ID 或用户�
 
 ### reminders
 
-`pending_cron` 表示数据库已有计划但真实 cron 尚未绑定；`active` 表示 `cron_job_id` 已回写；`batched` 表示并入简报；`cancelled`/`sent` 表示终态。
+`pending_cron` 表示数据库已有计划但真实 cron 尚未完成核验与绑定；`active` 表示 job ID 及非敏感 `delivery_proof` 已通过 fail-closed 验证；`batched` 表示并入简报；`cancelled`/`sent` 表示终态。原始收件目标不进入 reminders 或 audit_log。
 
 ### drafts
 
@@ -59,7 +59,8 @@ python3 scripts/secretary.py <command> [argument] --payload '<JSON object>' [--d
 | `init`, `doctor` | 初始化、完整性与版本检查 |
 | `draft`, `clarify`, `finalize` | 草稿、补充字段、确认写入 |
 | `create-project`, `set-next-action` | 项目容器和当前下一步 |
-| `get`, `list`, `update` | 查询和字段更新；`update action=bind-cron` 回写 job ID |
+| `get`, `list`, `update` | 查询和字段更新；`update action=bind-cron` 仅在 delivery proof 完整时回写 job ID |
+| `cron-audit-plan` | 列出升级后必须用 `cron show` 核验或重建的未来 Cron |
 | `complete`, `cancel`, `ack` | 完成、取消、收到并返回待删除 cron ID |
 | `snooze`, `reschedule`, `mark-sync-error` | 稍后提醒、先建后删改期、显式同步故障 |
 | `conflicts`, `plan-now` | 日程冲突和上下文推荐；`plan-now` 同时返回微信短报 |
@@ -75,8 +76,18 @@ python3 scripts/secretary.py <command> [argument] --payload '<JSON object>' [--d
 - `wechat_text`：可直接发送的纯文本短报。
 - `output_contract.format=wechat_plain_text_v1`。
 - `output_contract.markdown_tables=false`。
+- `output_contract.emoji=false`。
 
 Agent 必须直接使用 `wechat_text`，不得把结构化字段重新渲染成表格。结构化数组保留给排序、验证和“展开全部”重查使用。
+
+## 代码、数据与公开仓库边界
+
+- 公开 GitHub 仓库和 SkillHub ZIP：只含 `SKILL.md`、`scripts/`、`references/` 及仓库级源码、测试和版本说明。
+- 正式事项：默认只在运行 OpenClaw 的服务器 `~/.openclaw/data/personal-secretary-reminders/reminders.sqlite3`。
+- 备份和导出：只写到用户明确选择的服务器路径，不进入 Skill 目录。
+- Cron job：保存在 OpenClaw Gateway 的调度状态中；微信凭证和聊天路由保存在 OpenClaw 配置中。
+
+打包或提交前必须拒绝 `.sqlite`、`.sqlite3`、`.db`、备份、导出、密钥、环境文件和本机绝对路径。升级 Skill 目录不会迁移、上传或删除 SQLite 数据。
 
 ## 迁移原则
 
