@@ -76,7 +76,7 @@ class SecretaryTests(unittest.TestCase):
         result = self.db.doctor()
         self.assertTrue(result["ok"])
         self.assertEqual(result["schema_version"], 1)
-        self.assertEqual(result["app_version"], "1.2.1")
+        self.assertEqual(result["app_version"], "1.2.2")
         self.assertEqual(result["timezone"], "Asia/Shanghai")
         self.assertEqual(self.db.conn.execute("PRAGMA journal_mode").fetchone()[0], "wal")
 
@@ -329,7 +329,7 @@ class SecretaryTests(unittest.TestCase):
         self.assertNotIn("private-user-id", audit_text)
         self.assertNotIn('"target"', audit_text)
         plan = self.db.cron_audit_plan()
-        self.assertEqual(plan["app_version"], "1.2.1")
+        self.assertEqual(plan["app_version"], "1.2.2")
         self.assertEqual(plan["jobs"][0]["expected_job_kind"], "command")
         self.assertEqual(plan["jobs"][0]["expected_job_name"], f"psr:{reminder_id}")
         self.assertFalse(plan["jobs"][0]["requires_recreation"])
@@ -350,6 +350,31 @@ class SecretaryTests(unittest.TestCase):
             with self.subTest(kind=output.get("kind") or output.get("period") or "plan-now"):
                 self.assertFalse(output["output_contract"]["emoji"])
                 self.assertIsNone(emoji_pattern.search(output["wechat_text"]))
+
+    def test_default_digest_cron_plan_contains_weekly_and_monthly_only(self):
+        plan = self.db.digest_cron_plan()
+        self.assertEqual(plan["app_version"], "1.2.2")
+        self.assertEqual([job["name"] for job in plan["jobs"]], [
+            "psr:digest:weekly", "psr:digest:monthly",
+        ])
+        self.assertEqual([job["schedule"] for job in plan["jobs"]], [
+            "0 8 * * 1", "0 9 1 * *",
+        ])
+        self.assertTrue(all(job["timezone"] == "Asia/Shanghai" for job in plan["jobs"]))
+        self.assertTrue(all(job["job_kind"] == "command" for job in plan["jobs"]))
+        self.assertTrue(all(Path(job["command_argv"][1]).name == "cron_runner.py" for job in plan["jobs"]))
+        self.assertEqual(plan["disabled_by_default"], ["psr:digest:daily"])
+        self.assertTrue(plan["do_not_touch_other_cron_jobs"])
+
+    def test_sanitize_output_removes_emoji_emoticons_and_extra_spacing(self):
+        result = self.db.sanitize_output({
+            "text": "✅ **【已记录】** 😊<br/><br/>### 📌 任务：提交报告   ^_^\n状态：完成 🎉",
+        })
+        self.assertEqual(result["wechat_text"], "【已记录】\n\n任务：提交报告\n状态：完成")
+        self.assertTrue(result["changed"])
+        self.assertFalse(result["output_contract"]["emoji"])
+        with self.assertRaises(secretary.SecretaryError):
+            self.db.sanitize_output({"text": "   "})
 
     def test_p1_follow_up_once_and_ack_cancels_it(self):
         result = self.finalize(self.task_fields(deadline_at="2026-07-15T20:00:00+08:00"))
@@ -568,6 +593,10 @@ class SecretaryTests(unittest.TestCase):
         agenda = run("agenda", "week")
         self.assertEqual(agenda["result"]["period"], "week")
         self.assertIn("wechat_text", agenda["result"])
+        cron_plan = run("digest-cron-plan")
+        self.assertEqual(len(cron_plan["result"]["jobs"]), 2)
+        sanitized = run("sanitize-output", "--payload", json.dumps({"text": "✅ **已记录**"}, ensure_ascii=False))
+        self.assertEqual(sanitized["result"]["wechat_text"], "已记录")
 
 
 if __name__ == "__main__":

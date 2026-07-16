@@ -1,6 +1,6 @@
 ---
 name: personal-secretary-reminders
-description: 在 OpenClaw 云端作为私人秘书捕获、澄清、确认、保存、查询和复盘用户口语化表达的日程、待办、多步骤项目、以后要做、灵感、等待委派与参考信息；用于微信提醒、改期、完成、取消、优先级排序、每日/每周/每月简报，回答“我现在该做什么”，以及“这周/本周/这个月/本月还有什么事、帮我梳理一下”等期间事项查询。所有用户可见回复必须使用结论先行、无 Markdown 表格、无装饰性表情的微信纯文本短报格式；真实定时投递必须遵守 OpenClaw Cron 一致性协议。
+description: 在 OpenClaw 云端作为私人秘书捕获、澄清、确认、保存、查询和复盘用户口语化表达的日程、待办、项目、以后要做、灵感与等待委派；用于微信提醒、改期、完成、优先级排序、默认周报/月报，回答“我现在该做什么”及“这周/本月还有什么事”。所有用户可见回复必须是结论先行、无表格、无 HTML、无 emoji 和装饰符号的微信纯文本；真实投递必须遵守 OpenClaw Cron 一致性协议。
 ---
 
 # 私人秘书提醒事项
@@ -11,8 +11,8 @@ description: 在 OpenClaw 云端作为私人秘书捕获、澄清、确认、保
 
 1. 解析当前 Skill 根目录为 `<skill_dir>`。
 2. 运行 `python3 <skill_dir>/scripts/secretary.py doctor`。
-3. 数据库自动初始化到独立目录：`~/.openclaw/data/personal-secretary-reminders/reminders.sqlite3`。
-4. 仅在迁移、排错或测试时通过 `--db <path>` 或 `PERSONAL_SECRETARY_DB` 覆盖数据库。
+3. 运行 `digest-cron-plan`，按精确名称幂等确保 `psr:digest:weekly` 与 `psr:digest:monthly`；不创建日报，不触碰其他 Cron。
+4. 数据库自动初始化到 `~/.openclaw/data/personal-secretary-reminders/reminders.sqlite3`；仅在迁移、排错或测试时覆盖路径。
 
 所有脚本命令输出稳定 JSON。只根据 `ok` 和 `result` 行动；`ok=false` 时把可修正问题告诉用户，不要猜测写入结果。返回存在 `wechat_text` 时，直接发送该字段，不要重新排版。
 
@@ -27,6 +27,7 @@ description: 在 OpenClaw 云端作为私人秘书捕获、澄清、确认、保
 - 不声称提醒已生效，除非所有所需 cron 都成功创建并已回写 job ID。
 - 不向用户输出 Markdown 表格、代码块、原始 JSON、数据库字段名或长段推理；始终使用 `references/wechat-output-style.md`。
 - 除非用户在当前请求中明确要求，否则不使用 emoji、颜文字或装饰性图标符号；状态、风险和优先级全部用文字表达。
+- 脚本未返回 `wechat_text` 时，把拟发送文本传给 `sanitize-output`，只发送净化后的 `wechat_text`；不要用“好的”加表情作为开场。
 - 不把 OpenClaw 的聊天对象、账号 ID、微信凭证或服务器地址硬编码进 Skill、数据库模板或 Cron 消息；投递目标必须从当前会话上下文取得。
 
 ## 统一微信输出
@@ -39,6 +40,7 @@ description: 在 OpenClaw 云端作为私人秘书捕获、澄清、确认、保
 - 普通确认控制在一个手机屏幕左右；长清单先给完整计数，再分类展示，超出部分明确说明如何展开。
 - 失败信息先说影响，再说下一步；不要输出内部堆栈或工具细节。
 - 脚本返回 `wechat_text` 时优先逐字发送；只有用户明确要求其他格式时才改写。
+- 自行撰写的追问、确认和错误说明必须先调用 `sanitize-output`；它会移除 emoji、常见颜文字、HTML 和 Markdown 装饰。
 
 ## 捕获—澄清—确认—写入
 
@@ -92,7 +94,7 @@ python3 <skill_dir>/scripts/secretary.py finalize --payload '{"draft_id":"<id>",
 ### 新建
 
 1. `finalize` 会把待调度项保存为 `pending_schedule`，并返回每个提醒的 `reminder_id`、绝对 UTC `trigger_at` 和 `message`。
-2. 优先使用 OpenClaw 原生 Cron 工具，从当前入站消息的结构化 delivery context 取得 agent、明确 channel 和精确收件目标。没有明确目标、目标为 `last`、或只能创建 isolated agent session 时停止；不创建、不绑定、不声称生效。
+2. 优先使用 OpenClaw 原生 Cron 工具，从当前入站消息的结构化 delivery context 取得 agent、明确 channel 和精确收件目标。没有明确目标或目标为 `last` 时停止；不创建、不绑定、不声称生效。
 3. 为每个提醒创建名称严格等于 `psr:<reminder_id>` 的一次性 command Cron，直接运行 `cron_runner.py`。每成功创建一个 Cron，取得并暂存真实 job ID。
 4. 立即运行 `openclaw cron show <job_id>` 或等价原生工具读取结构化结果，逐项确认：command job、名称正确、runner 正确、`delivery.mode=announce`、channel 明确、目标非空且与当前入站会话一致、不是 isolated session。只形成布尔化和渠道名的非敏感 `delivery_proof`，不得把原始收件目标写进数据库或日志。
 5. 全部验证成功后调用：
@@ -101,12 +103,12 @@ python3 <skill_dir>/scripts/secretary.py finalize --payload '{"draft_id":"<id>",
 python3 <skill_dir>/scripts/secretary.py update --payload '{"action":"bind-cron","reminder_bindings":[{"reminder_id":"<reminder_id>","cron_job_id":"<job_id>","delivery_proof":{"job_kind":"command","job_name":"psr:<reminder_id>","command_runner":"cron_runner.py","command_reminder_id":"<reminder_id>","delivery_mode":"announce","delivery_channel":"<current_channel>","delivery_target_present":true,"delivery_matches_current_context":true,"isolated_session":false,"verified_via":"cron_show"}}]}'
 ```
 
-6. `bind-cron` 会拒绝旧式无证明绑定、空目标、`last` 渠道或 isolated session。任一创建或验证失败时删除本轮已建 job，最多重试一次；再调用 `mark-sync-error`，清楚说明事项已保存但提醒尚未生效。
+6. `bind-cron` 只接受本 Skill 的确定性 command job，并拒绝旧式无证明绑定、空目标、`last` 渠道或 agentTurn。OpenClaw 的 isolated agentTurn 本身可以合法投递，但不属于本 Skill 的确定性绑定契约。任一创建或验证失败时回滚本轮 job，并明确说明提醒尚未生效。
 7. Cron 使用确定性 command job 运行 `scripts/cron_runner.py reminder --reminder-id <id>`。它只输出提醒正文或 `NO_REPLY`；不要为到点投递额外启动模型会话。这样同一提醒即使重复触发也只投递一次。
 
-### 从 1.2.0 升级到 1.2.1
+### 从旧版本升级
 
-首次处理提醒前运行 `python3 <skill_dir>/scripts/secretary.py cron-audit-plan`。对返回的每个未来 job 执行 `cron show` 并按上述条件核验。旧 job 缺少明确目标、使用 `last`、属于 isolated session 或运行错误命令时，必须先创建并验证新 job、成功绑定后再删除旧 job；无法验证时保留事项并标记同步异常，不得假定历史提醒可投递。
+先运行 `cron-audit-plan`。旧 job 若有明确、匹配当前微信的 announce delivery，可以继续运行；不要仅因 `sessionTarget=isolated` 自动删除。缺少目标或投递失败时，先创建并验证新 command job、成功绑定后再删除旧 job。
 
 ### 修改、终止与确认
 
@@ -152,23 +154,20 @@ python3 <skill_dir>/scripts/secretary.py agenda month
 
 ## 简报与回顾
 
-按需运行：
+按需生成：
 
 ```bash
-python3 <skill_dir>/scripts/secretary.py digest daily
 python3 <skill_dir>/scripts/secretary.py digest weekly
 python3 <skill_dir>/scripts/secretary.py digest monthly
 ```
 
-- 每日 09:00：最多 3 项重点、紧接硬日程、已过 start-by、逾期、次要项、等待项。
 - 每周一 08:00：本周日程与 P1/P2、上周行为、僵尸项目、等待过久、灵感、估时偏差和规则建议。
 - 每月 1 日 09:00：关键结果、长期项目、P2 挤压、Someday、灵感、完成与延期指标、具备样本的建议。
-- 月报与日报同一分钟触发时合并成一次输出。
-- 同一分钟普通提醒合并；P2-P4 系统提醒尽量使用简报中的 `batched_reminders`，不要单独轰炸用户。
+- 日报不创建周期 Cron；`digest daily` 仅保留为用户主动查询时的兼容能力。
 
-三类 digest 均返回 `wechat_text`。周期简报触发后直接投递该字段，不要让 Agent 另行生成表格或长报告。
+运行 `digest-cron-plan`，按精确名称检查、创建或修复两个 command Cron；已存在且配置正确时不重复创建。两者使用 `Asia/Shanghai`、明确的当前微信 delivery，并直接运行 `cron_runner.py digest <kind>`。不要触碰名称无关的合规部或其他 Cron。
 
-按 `references/openclaw-cron.md` 用 OpenClaw command Cron 创建三类周期简报，运行 `scripts/cron_runner.py digest <kind>` 并直接投递其标准输出；不要为每次简报预先创建一批一次性 job，也不要启动模型重新改写 `wechat_text`。
+周报、月报触发后直接发送脚本输出，不要启动模型重新改写。
 
 ## 常用操作
 
@@ -177,6 +176,8 @@ python3 <skill_dir>/scripts/secretary.py get --payload '{"entity":"item","id":"<
 python3 <skill_dir>/scripts/secretary.py fire-reminder --payload '{"reminder_id":"<reminder_id>"}'
 python3 <skill_dir>/scripts/secretary.py list --payload '{"status":"active"}'
 python3 <skill_dir>/scripts/secretary.py cron-audit-plan
+python3 <skill_dir>/scripts/secretary.py digest-cron-plan
+python3 <skill_dir>/scripts/secretary.py sanitize-output --payload '{"text":"<拟发送内容>"}'
 python3 <skill_dir>/scripts/secretary.py agenda week
 python3 <skill_dir>/scripts/secretary.py agenda month
 python3 <skill_dir>/scripts/secretary.py conflicts --payload '{"start_at":"2026-07-16T09:00:00+08:00","end_at":"2026-07-16T10:00:00+08:00"}'
