@@ -61,6 +61,8 @@ python3 scripts/secretary.py <command> [argument] --payload '<JSON object>' [--d
 | `create-project`, `set-next-action` | 项目容器和当前下一步 |
 | `get`, `list`, `update` | 查询和字段更新；`update action=bind-cron` 仅在 delivery proof 完整时回写 job ID |
 | `cron-audit-plan` | 列出升级后必须用 `cron show` 核验或重建的未来 Cron |
+| `digest-cron-plan` | 返回默认周报、月报的两个幂等 Cron 计划；不含日报 |
+| `sanitize-output` | 清除拟发送文本中的 emoji、常见颜文字、HTML 和 Markdown 装饰 |
 | `complete`, `cancel`, `ack` | 完成、取消、收到并返回待删除 cron ID |
 | `snooze`, `reschedule`, `mark-sync-error` | 稍后提醒、先建后删改期、显式同步故障 |
 | `conflicts`, `plan-now` | 日程冲突和上下文推荐；`plan-now` 同时返回微信短报 |
@@ -79,6 +81,7 @@ python3 scripts/secretary.py <command> [argument] --payload '<JSON object>' [--d
 - `output_contract.emoji=false`。
 
 Agent 必须直接使用 `wechat_text`，不得把结构化字段重新渲染成表格。结构化数组保留给排序、验证和“展开全部”重查使用。
+Agent 自行生成的用户可见文字先传给 `sanitize-output`，再发送返回的 `wechat_text`。
 
 ## 代码、数据与公开仓库边界
 

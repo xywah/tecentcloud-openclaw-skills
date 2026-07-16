@@ -6,6 +6,8 @@
 
 所有用户可见回复同时遵守 `wechat-output-style.md`：结论先行、纯文本分组、禁止 Markdown 表格、原始 JSON、emoji、颜文字和装饰性图标符号。除非用户在当前请求中明确要求，否则不例外。
 
+Agent 自行撰写的追问、确认或错误说明必须先经 `sanitize-output`；脚本已经返回 `wechat_text` 时直接发送，不再添加开场、表情或装饰。
+
 ## 分类决策
 
 1. 必须在某个时刻发生，错过即失效：`event`。
@@ -77,7 +79,7 @@
 
 - 不能确定指的是哪条事项时，列出最多 3 个候选让用户选。
 - cron 创建失败时明确说“事项已保存，但提醒未生效”，不要用模糊成功话术。
-- cron 缺少明确 delivery 目标、使用 `last` 或进入 isolated session 时视为创建失败；不要仅凭存在 job ID 宣称生效。
+- cron 缺少明确 delivery 目标或使用 `last` 时视为创建失败；isolated 是执行上下文，不等于投递失败。本 Skill 的新提醒仍优先使用确定性 command job。
 - 数据库写入失败时不得继续创建 cron，避免出现孤儿提醒。
 - 发现 `sync_error` 时优先修复或告知，禁止静默创建重复提醒。
 - OpenClaw Gateway 不可达或云服务器离线时说明不能实际投递；Cron 持久化不等于离线仍能发微信。

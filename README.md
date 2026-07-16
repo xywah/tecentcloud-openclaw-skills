@@ -32,7 +32,7 @@ For recovery, explicit tag deployment, or diagnostics, one Skill can still be in
 ```bash
 tools/openclaw-deploy/update_from_github.sh \
   --repo https://github.com/xywah/tecentcloud-openclaw-skills.git \
-  --ref personal-secretary-reminders-v1.2.1 \
+  --ref personal-secretary-reminders-v1.2.2 \
   --skill-path personal-secretary-reminders
 ```
 

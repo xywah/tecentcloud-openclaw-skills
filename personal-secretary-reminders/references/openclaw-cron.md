@@ -20,7 +20,7 @@
 5. 只在所有 job 创建成功后声称提醒已生效；部分失败必须回滚本轮 job，并把事项标为 `sync_error`。
 6. 同一 Cron 创建或删除最多重试一次，避免静默制造重复任务。
 7. 每次创建后按唯一名称或 job ID 查询校验；不得从非结构化日志中猜 job ID。
-8. 缺少明确投递目标、渠道为 `last`、目标与当前入站会话不一致，或任务会进入 isolated agent session 时，一律按失败处理。
+8. 缺少明确投递目标、渠道为 `last` 或目标与当前入站会话不一致时，一律按失败处理。本 Skill 新绑定的提醒采用 command job；已有 isolated agentTurn 若 delivery 明确且有效，不因 isolated 本身自动删除。
 9. SQLite 只保存 job ID 和非敏感核验结论；不得保存原始收件目标、OpenID、sender ID 或聊天凭证。
 
 ## 首次检查
@@ -105,21 +105,19 @@ python3 <skill_dir>/scripts/cron_runner.py reminder --reminder-id <reminder_id>
 
 ## 周期简报
 
-周期任务使用 `--cron`、`--tz Asia/Shanghai` 和同样的 `--command-argv` 投递方式，并保持相同的 channel、recipient 和必要 account：
+运行 `digest-cron-plan`，按精确名称幂等维护两个 command job，并使用 `--tz Asia/Shanghai`、明确 channel、recipient 和必要 account：
 
-- 每日简报：`0 9 * * *`
 - 每周简报：`0 8 * * 1`
 - 每月简报：`0 9 1 * *`
 
 command argv 分别运行：
 
 ```text
-python3 <skill_dir>/scripts/cron_runner.py digest daily
 python3 <skill_dir>/scripts/cron_runner.py digest weekly
 python3 <skill_dir>/scripts/cron_runner.py digest monthly
 ```
 
-脚本只输出对应 `wechat_text` 或 `NO_REPLY`。不要让模型重新排版。月报与日报同时触发时只保留月报任务负责合并输出，避免同一分钟重复消息。
+日报默认不调度；脚本只输出对应 `wechat_text` 或 `NO_REPLY`。不要让模型重新排版，也不要修改名称不相关的其他 Cron。
 
 ## 修改和删除
 

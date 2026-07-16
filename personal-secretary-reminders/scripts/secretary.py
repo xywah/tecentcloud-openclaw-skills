@@ -13,6 +13,7 @@ import argparse
 import csv
 import json
 import os
+import re
 import shutil
 import sqlite3
 import statistics
@@ -25,7 +26,7 @@ from zoneinfo import ZoneInfo
 
 
 APP_NAME = "personal-secretary-reminders"
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.2.2"
 SCHEMA_VERSION = 1
 ACTIVE_STATES = ("active", "scheduled", "pending_schedule", "sync_error")
 VALID_STATES = {
@@ -34,6 +35,10 @@ VALID_STATES = {
 }
 VALID_TYPES = {"event", "task", "someday", "idea", "waiting", "reference"}
 ENERGY_RANK = {"low": 1, "medium": 2, "high": 3}
+EMOJI_RE = re.compile("[\U0001F000-\U0001FAFF\u2600-\u27BF\uFE0F\u200D\u20E3]")
+EMOTICON_RE = re.compile(r"(?<!\w)(?:\^_\^|T_T|>_<|:-?\)|:-?\(|;-?\)|:D)(?!\w)")
+HTML_BREAK_RE = re.compile(r"<br\s*/?>", re.IGNORECASE)
+HTML_TAG_RE = re.compile(r"<[^>]+>")
 
 
 def default_database_path(
@@ -799,7 +804,7 @@ class SecretaryDB:
         if proof.get("delivery_matches_current_context") is not True:
             raise SecretaryError("cron delivery target must match the current inbound chat")
         if proof.get("isolated_session") is not False:
-            raise SecretaryError("reminder delivery must use a command job, not an isolated agent session")
+            raise SecretaryError("this Skill binds deterministic command jobs, not isolated agent turns")
         return {
             "reminder_id": reminder_id,
             "cron_job_id": cron_job_id,
@@ -877,6 +882,67 @@ class SecretaryDB:
         } for row in rows]
         return {"app_version": APP_VERSION, "count": len(jobs), "jobs": jobs,
                 "policy": "verify every job with cron show; recreate before retiring an invalid job"}
+
+    def digest_cron_plan(self) -> dict[str, Any]:
+        """Return the small, idempotent default digest schedule; never create jobs itself."""
+        skill_dir = Path(__file__).resolve().parent.parent
+        runner = skill_dir / "scripts" / "cron_runner.py"
+        jobs = []
+        for kind, name, schedule in (
+            ("weekly", "psr:digest:weekly", "0 8 * * 1"),
+            ("monthly", "psr:digest:monthly", "0 9 1 * *"),
+        ):
+            jobs.append({
+                "kind": kind,
+                "name": name,
+                "schedule": schedule,
+                "timezone": self.tz_name,
+                "job_kind": "command",
+                "command_argv": ["python3", str(runner), "digest", kind],
+                "command_cwd": str(skill_dir),
+                "delivery_mode": "announce",
+                "delivery_context": "current_inbound_chat",
+            })
+        return {
+            "app_version": APP_VERSION,
+            "policy": "reconcile by exact name; create missing, repair mismatches, never duplicate",
+            "jobs": jobs,
+            "disabled_by_default": ["psr:digest:daily"],
+            "do_not_touch_other_cron_jobs": True,
+        }
+
+    @staticmethod
+    def sanitize_output(payload: dict[str, Any]) -> dict[str, Any]:
+        text = payload.get("text")
+        if not isinstance(text, str) or not text.strip():
+            raise SecretaryError("sanitize-output requires non-empty text")
+        normalized = HTML_BREAK_RE.sub("\n", text)
+        normalized = HTML_TAG_RE.sub("", normalized)
+        normalized = normalized.replace("**", "").replace("__", "").replace("`", "")
+        cleaned_lines = []
+        previous_blank = False
+        for line in normalized.splitlines():
+            cleaned = EMOJI_RE.sub("", line)
+            cleaned = EMOTICON_RE.sub("", cleaned)
+            cleaned = re.sub(r"^#{1,6}\s+", "", cleaned)
+            cleaned = re.sub(r"[ \t]{2,}", " ", cleaned).strip()
+            if not cleaned:
+                if not previous_blank:
+                    cleaned_lines.append("")
+                previous_blank = True
+                continue
+            cleaned_lines.append(cleaned)
+            previous_blank = False
+        cleaned_text = "\n".join(cleaned_lines).strip()
+        return {
+            "wechat_text": cleaned_text,
+            "changed": cleaned_text != text.strip(),
+            "output_contract": {
+                "format": "wechat_plain_text_v1",
+                "markdown_tables": False,
+                "emoji": False,
+            },
+        }
 
     def update_item(self, payload: dict[str, Any]) -> dict[str, Any]:
         if payload.get("action") == "bind-cron":
@@ -1644,7 +1710,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("command", choices=[
         "init", "doctor", "draft", "clarify", "finalize", "create-project", "set-next-action",
         "get", "update", "complete", "cancel", "ack", "snooze", "reschedule", "fire-reminder", "mark-sync-error",
-        "cron-audit-plan",
+        "cron-audit-plan", "digest-cron-plan", "sanitize-output",
         "conflicts", "list", "agenda", "plan-now", "digest", "record-actual", "recommend-rules", "accept-rule",
         "backup", "export",
     ])
@@ -1667,6 +1733,8 @@ def dispatch(db: SecretaryDB, command: str, argument: str | None, payload: dict[
         "snooze": lambda: db.snooze(payload), "reschedule": lambda: db.reschedule(payload),
         "fire-reminder": lambda: db.fire_reminder(payload),
         "cron-audit-plan": lambda: db.cron_audit_plan(),
+        "digest-cron-plan": lambda: db.digest_cron_plan(),
+        "sanitize-output": lambda: db.sanitize_output(payload),
         "mark-sync-error": lambda: db.mark_sync_error(payload), "conflicts": lambda: db.conflicts(payload),
         "list": lambda: db.list_items(payload),
         "agenda": lambda: db.agenda(argument or payload.get("period", "week"), payload),
